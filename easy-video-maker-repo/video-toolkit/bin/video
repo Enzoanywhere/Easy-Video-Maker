@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# 视频流水线统一入口。所有依赖从 env.sh 读取，避免各对话重复安装/重复找路径。
+set -euo pipefail
+
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  LINK_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$LINK_DIR/$SOURCE"
+done
+BIN_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+TOOLKIT_DIR="$(dirname "$BIN_DIR")"
+# shellcheck disable=SC1091
+source "$TOOLKIT_DIR/env.sh"
+
+usage() {
+  cat <<'EOF'
+video — WorkBuddy 短视频流水线统一入口
+
+用法:
+  video doctor
+      检查 Python/Node/Remotion/音频工具是否齐全
+
+  video new <id> "<标题>" [--profile child|five|adult] [--voice VOICE] [--rate +15%]
+      从 pawpatrol-s1 模板创建新工程，并写入语速/音色档位
+      档位: child=-15% 明亮；five=+5%；adult=+15% 深色成人向
+
+  video build <工程目录>
+      联网重建配音+字幕+渲染（改过 script.txt 时用）
+
+  video offline <工程目录>
+      离线渲染（沿用已有音频，断网可用，0 token）
+
+  video audio <工程目录>
+      只重生成配音/SRT/时间轴
+
+  video bgm <工程目录> --style march|fusion|strings|catchy|rock|rock2|choral
+      用共享生成器做原创 BGM；默认 choral。各版本独立文件，不覆盖在用 BGM（march 除外）
+
+  video analyze <音频路径> [--format text|json]
+      分析参考曲调性/听感来源/编制/节奏动机；只输出风格参数，不复制旋律
+
+  video clean <工程目录>
+      清理 .tmp / in-progress / check PNG
+
+  video scripts
+      打印共享资产绝对路径，方便其他 AI 工具直接引用
+
+示例:
+  source /Users/a123/WorkBuddy/2026-11-25-10-23-46/video-toolkit/env.sh
+  video doctor
+  video new s7 "第 7 季观看指南" --profile child
+  video bgm ../pawpatrol-s7 --style choral
+  video build ../pawpatrol-s7
+EOF
+}
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+check_project() {
+  local dir="$1"
+  [ -n "$dir" ] || die "缺少工程目录参数"
+  [ -d "$dir" ] || die "目录不存在: $dir"
+  [ -d "$dir/scripts" ] || die "不是视频工程目录（缺少 scripts/）: $dir"
+}
+
+CMD="${1:-}"
+[ -n "$CMD" ] || { usage; exit 1; }
+
+case "$CMD" in
+  doctor)
+    exec "$WB_PYTHON" "$TOOLKIT_DIR/scripts/doctor.py"
+    ;;
+
+  new)
+    shift
+    ID="${1:-}"
+    TITLE="${2:-}"
+    [ -n "$ID" ] && [ -n "$TITLE" ] || die "用法: video new <id> \"<标题>\" [--profile child|five|adult]"
+    shift 2 || true
+    PROFILE="child"
+    VOICE=""
+    RATE=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --profile) PROFILE="${2:-}"; shift 2 ;;
+        --voice) VOICE="${2:-}"; shift 2 ;;
+        --rate) RATE="${2:-}"; shift 2 ;;
+        *) die "未知参数: $1" ;;
+      esac
+    done
+    echo "== 创建新工程: $ID / $TITLE / profile=$PROFILE =="
+    bash "$WB_TEMPLATE/scripts/new-episode.sh" "$ID" "$TITLE"
+    DEST="$WB_ROOT/pawpatrol-$ID"
+    ARGS=("$DEST" --profile "$PROFILE")
+    [ -n "$VOICE" ] && ARGS+=(--voice "$VOICE")
+    [ -n "$RATE" ] && ARGS+=(--rate "$RATE")
+    "$WB_PYTHON" "$TOOLKIT_DIR/scripts/apply_profile.py" "${ARGS[@]}"
+    echo ""
+    echo "下一步: 编辑 $DEST/script.txt 与 src/scenes/，然后 video build $DEST"
+    ;;
+
+  build|offline|audio|clean)
+    shift
+    DIR="${1:-$PWD}"
+    check_project "$DIR"
+    case "$CMD" in
+      build) exec bash "$DIR/scripts/build.sh" ;;
+      offline) exec bash "$DIR/scripts/render-offline.sh" ;;
+      audio) (cd "$DIR" && exec "$WB_PYTHON" scripts/gen_audio.py) ;;
+      clean) exec "$WB_PYTHON" "$DIR/scripts/cleanup.py" --limit 40 ;;
+    esac
+    ;;
+
+  bgm)
+    shift
+    DIR="${1:-$PWD}"
+    check_project "$DIR"
+    shift || true
+    STYLE="choral"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --style) STYLE="${2:-}"; shift 2 ;;
+        *) die "未知参数: $1" ;;
+      esac
+    done
+    case "$STYLE" in
+      march) SCRIPT="gen_bgm.py"; OUT="bgm.wav" ;;
+      fusion) SCRIPT="gen_bgm_fusion.py"; OUT="bgm-fusion.wav" ;;
+      strings) SCRIPT="gen_bgm_strings.py"; OUT="bgm-strings.wav" ;;
+      catchy) SCRIPT="gen_bgm_catchy.py"; OUT="bgm-catchy.wav" ;;
+      rock) SCRIPT="gen_bgm_rock.py"; OUT="bgm-rock.wav" ;;
+      rock2) SCRIPT="gen_bgm_rock2.py"; OUT="bgm-rock2.wav" ;;
+      choral) SCRIPT="gen_bgm_choral.py"; OUT="bgm-choral.wav" ;;
+      *) die "未知 BGM 风格: $STYLE" ;;
+    esac
+    cp "$TOOLKIT_DIR/scripts/bgm/$SCRIPT" "$DIR/scripts/$SCRIPT"
+    echo "== 生成原创 BGM: $STYLE -> $OUT =="
+    (cd "$DIR" && "$WB_PYTHON" "scripts/$SCRIPT")
+    echo "输出: $DIR/public/audio/$OUT"
+    ;;
+
+  analyze)
+    shift
+    exec "$WB_PYTHON" "$TOOLKIT_DIR/scripts/audio/analyze_reference.py" "$@"
+    ;;
+
+  scripts)
+    echo "WB_ROOT=$WB_ROOT"
+    echo "WB_TOOLKIT=$WB_TOOLKIT"
+    echo "WB_PYTHON=$WB_PYTHON"
+    echo "WB_TEMPLATE=$WB_TEMPLATE"
+    echo "WB_NODE_MODULES=$WB_NODE_MODULES"
+    echo "WB_REMOTION_BROWSER=$WB_REMOTION_BROWSER"
+    echo "BGM_SCRIPTS=$TOOLKIT_DIR/scripts/bgm"
+    echo "ANALYZER=$TOOLKIT_DIR/scripts/audio/analyze_reference.py"
+    ;;
+
+  --help|-h|help)
+    usage
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac
